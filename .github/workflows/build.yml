@@ -92,12 +92,16 @@ jobs:
           
           import android.app.Activity;
           import android.app.Dialog;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
           import android.content.Context;
           import android.content.SharedPreferences;
           import android.graphics.Color;
           import android.graphics.drawable.ColorDrawable;
           import android.graphics.drawable.GradientDrawable;
           import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
           import android.util.DisplayMetrics;
           import android.view.Gravity;
           import android.view.MotionEvent;
@@ -149,6 +153,7 @@ jobs:
               static volatile Interpolator curve = buildCurve(DEF_BOUNCE);
           
               private static boolean cfgLoaded = false;
+              private static java.lang.ref.WeakReference<Activity> cur;
               private static boolean menuShowing = false;
               private static boolean toasted = false;
           
@@ -245,6 +250,7 @@ jobs:
                                       try {
                                           Activity a = (Activity) p.thisObject;
                                           loadCfg(a);
+                                          cur = new java.lang.ref.WeakReference<Activity>(a);
                                           scheduleEntryCheck(a);
                                       } catch (Throwable t) {
                                           XposedBridge.log(TAG + "entry 失败: " + t);
@@ -461,6 +467,18 @@ jobs:
                       tip.setPadding(0, dp(a, 12), 0, 0);
                       root.addView(tip);
           
+                      TextView dump = button(a, "排查残影：15 秒后复制页面结构", new View.OnClickListener() {
+                          @Override
+                          public void onClick(View v) {
+                              d.dismiss();
+                              scheduleDump(a);
+                          }
+                      });
+                      dump.setLayoutParams(new LinearLayout.LayoutParams(
+                              LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                      dump.setPadding(0, dp(a, 14), 0, 0);
+                      root.addView(dump);
+          
                       LinearLayout row = new LinearLayout(a);
                       row.setOrientation(LinearLayout.HORIZONTAL);
                       row.setPadding(0, dp(a, 10), 0, 0);
@@ -498,6 +516,61 @@ jobs:
                   } catch (Throwable t) {
                       menuShowing = false;
                       XposedBridge.log(TAG + "showMenu 失败: " + t);
+                  }
+              }
+          
+              // ================= 排查工具：复制当前页面的视图结构 =================
+          
+              private static void scheduleDump(final Activity a) {
+                  try {
+                      Toast.makeText(a, "15 秒内请回到抖音视频页面，之后会自动复制页面结构",
+                              Toast.LENGTH_LONG).show();
+                  } catch (Throwable ignored) { }
+                  new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              Activity t = cur != null ? cur.get() : null;
+                              if (t == null) t = a;
+                              StringBuilder sb = new StringBuilder();
+                              sb.append("Activity: ").append(t.getClass().getName()).append('\n');
+                              int[] cnt = {0};
+                              dumpTree(t.getWindow().getDecorView(), 0, sb, cnt);
+                              ClipboardManager cm =
+                                      (ClipboardManager) t.getSystemService(Context.CLIPBOARD_SERVICE);
+                              cm.setPrimaryClip(ClipData.newPlainText("douyin_view_tree", sb.toString()));
+                              Toast.makeText(t, "页面结构已复制（" + cnt[0] + " 行），请粘贴发给我",
+                                      Toast.LENGTH_LONG).show();
+                          } catch (Throwable th) {
+                              XposedBridge.log(TAG + "dump 失败: " + th);
+                          }
+                      }
+                  }, 15000);
+              }
+          
+              private static void dumpTree(View v, int depth, StringBuilder sb, int[] cnt) {
+                  if (cnt[0] >= 700 || depth > 45) return;
+                  cnt[0]++;
+                  for (int i = 0; i < depth; i++) sb.append(' ');
+                  sb.append(v.getClass().getName());
+                  int id = v.getId();
+                  if (id != View.NO_ID) {
+                      try {
+                          sb.append(" #").append(v.getResources().getResourceEntryName(id));
+                      } catch (Throwable ignored) {
+                          sb.append(" #").append(id);
+                      }
+                  }
+                  sb.append(' ').append(v.getWidth()).append('x').append(v.getHeight());
+                  sb.append(" y=").append((int) v.getTranslationY());
+                  sb.append(" a=").append(String.format(Locale.US, "%.2f", v.getAlpha()));
+                  if (v.getVisibility() == View.GONE) sb.append(" GONE");
+                  else if (v.getVisibility() == View.INVISIBLE) sb.append(" INVIS");
+                  if (v.getLayerType() != View.LAYER_TYPE_NONE) sb.append(" layer=").append(v.getLayerType());
+                  sb.append('\n');
+                  if (v instanceof ViewGroup && v.getVisibility() != View.GONE) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) dumpTree(g.getChildAt(i), depth + 1, sb, cnt);
                   }
               }
           
