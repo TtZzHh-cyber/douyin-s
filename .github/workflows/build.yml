@@ -1,16 +1,6 @@
 name: Build APK
 on:
   workflow_dispatch:
-    inputs:
-      duration:
-        description: '动画时长倍数（越大越慢，默认2.5）'
-        default: '2.5'
-      frequency:
-        description: '回弹频率（越小回弹越慢越松，默认1.0）'
-        default: '1.0'
-      damping:
-        description: '阻尼（越大回弹越小，默认0.55）'
-        default: '0.55'
   push:
 jobs:
   build:
@@ -101,13 +91,35 @@ jobs:
           package com.example.douyinspring;
           
           import android.app.Activity;
+          import android.app.Dialog;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.graphics.drawable.ColorDrawable;
+          import android.graphics.drawable.GradientDrawable;
           import android.os.Bundle;
+          import android.util.DisplayMetrics;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.ViewConfiguration;
+          import android.view.Window;
+          import android.view.WindowManager;
           import android.view.animation.Interpolator;
+          import android.view.animation.PathInterpolator;
+          import android.widget.CompoundButton;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
           import android.widget.OverScroller;
           import android.widget.Scroller;
+          import android.widget.SeekBar;
+          import android.widget.Switch;
+          import android.widget.TextView;
           import android.widget.Toast;
           
           import java.util.HashSet;
+          import java.util.Locale;
           import java.util.Set;
           
           import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -117,58 +129,49 @@ jobs:
           import de.robv.android.xposed.callbacks.XC_LoadPackage;
           
           /**
-           * 抖音上下滑动翻页 -> 弹簧回弹过渡动画 (v2)
-           * 对应 iOS 插件：用 usingSpringWithDamping 的弹簧动画替换翻页动画。
+           * 抖音上下滑动翻页 -> 弹簧回弹过渡动画 (v6: 按参考录屏拟合的曲线)
            */
           public class MainHook implements IXposedHookLoadPackage {
           
               private static final String TAG = "[DouyinSpring] ";
+              private static final String ENTRY_TAG = "ds_entry";
+              private static final String[] MARKERS = {"账号与安全", "隐私设置", "通用设置"};
+              private static final String PREF = "douyin_spring_cfg";
           
-              // ===== 可调参数 =====
-              private static final float DAMPING = 0.55f;      // 越大回弹越小
-              private static final float FREQUENCY = 1.1f;     // 越大回弹越快
-              private static final float DURATION_SCALE = 1.5f; // 时长倍数
+              private static final boolean DEBUG = false; // 关闭：避免每次滚动都生成堆栈造成卡顿
+              private static final int DEF_DUR_MS = 320;
+              private static final float DEF_BOUNCE = 0.15f;
+          
+              // ===== 运行时可调参数（由菜单修改） =====
+              static volatile boolean enabled = true;
+              static volatile int durMs = DEF_DUR_MS;
+              static volatile float bounce = DEF_BOUNCE;
+              static volatile Interpolator curve = buildCurve(DEF_BOUNCE);
+          
+              private static boolean cfgLoaded = false;
+              private static boolean menuShowing = false;
+              private static boolean toasted = false;
           
               private static final String RV_CLASS = "androidx.recyclerview.widget.RecyclerView";
               private static final String ACTION_CLASS =
                       "androidx.recyclerview.widget.RecyclerView$SmoothScroller$Action";
               private static final int UNDEFINED_DURATION = Integer.MIN_VALUE;
-          
-              private static boolean toasted = false;
               private static final Set<String> seen = new HashSet<>();
+          
+              private static final Interpolator SPRING = new SpringInterpolator();
           
               @Override
               public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
                   if (!"com.ss.android.ugc.aweme".equals(lpparam.packageName)) return;
                   XposedBridge.log(TAG + "模块已注入, process=" + lpparam.processName);
           
-                  final Interpolator spring = new SpringInterpolator(DAMPING, FREQUENCY);
-          
-                  // 0) 启动提示：用来确认模块真的生效
                   if (lpparam.packageName.equals(lpparam.processName)) {
-                      try {
-                          XposedHelpers.findAndHookMethod(Activity.class, "onCreate", Bundle.class,
-                                  new XC_MethodHook() {
-                                      @Override
-                                      protected void afterHookedMethod(MethodHookParam p) {
-                                          if (toasted) return;
-                                          toasted = true;
-                                          try {
-                                              Toast.makeText((Activity) p.thisObject,
-                                                      "弹簧动画模块已加载", Toast.LENGTH_LONG).show();
-                                          } catch (Throwable ignored) { }
-                                      }
-                                  });
-                      } catch (Throwable t) {
-                          XposedBridge.log(TAG + "toast hook 失败: " + t);
-                      }
+                      hookUi();
                   }
           
-                  // 1) 系统 Scroller / OverScroller（老式 ViewPager 翻页走这里）
-                  hookScroller(Scroller.class, "Scroller", spring);
-                  hookScroller(OverScroller.class, "OverScroller", spring);
+                  hookScroller(Scroller.class, "Scroller");
+                  hookScroller(OverScroller.class, "OverScroller");
           
-                  // 2) RecyclerView（ViewPager2 / PagerSnapHelper 走这里）
                   ClassLoader cl = lpparam.classLoader;
                   Class<?> rv = XposedHelpers.findClassIfExists(RV_CLASS, cl);
                   Class<?> action = XposedHelpers.findClassIfExists(ACTION_CLASS, cl);
@@ -184,13 +187,12 @@ jobs:
                                       protected void beforeHookedMethod(MethodHookParam p) {
                                           int dx = (int) p.args[0];
                                           int dy = (int) p.args[1];
-                                          logCaller("RV.smoothScrollBy", dx, dy);
-                                          if (dy == 0 || dx != 0) return;
-                                          p.args[2] = spring;
-                                          p.args[3] = scale((int) p.args[3]);
+                                          if (DEBUG) logCaller("RV.smoothScrollBy", dx, dy);
+                                          if (!isPageScroll(dx, dy)) return;
+                                          p.args[2] = SPRING;
+                                          p.args[3] = pageDuration(dy);
                                       }
                                   });
-                          XposedBridge.log(TAG + "hook RecyclerView.smoothScrollBy OK");
                       } catch (Throwable t) {
                           XposedBridge.log(TAG + "hook smoothScrollBy 失败: " + t);
                       }
@@ -202,24 +204,306 @@ jobs:
                               protected void beforeHookedMethod(MethodHookParam p) {
                                   int dx = (int) p.args[0];
                                   int dy = (int) p.args[1];
-                                  logCaller("RV.Action", dx, dy);
-                                  if (dy == 0 || dx != 0) return;
-                                  p.args[2] = scale((int) p.args[2]);
-                                  p.args[3] = spring;
+                                  if (DEBUG) logCaller("RV.Action", dx, dy);
+                                  if (!isPageScroll(dx, dy)) return;
+                                  p.args[2] = pageDuration(dy);
+                                  p.args[3] = SPRING;
                               }
                           };
                           XposedHelpers.findAndHookConstructor(action,
                                   int.class, int.class, int.class, Interpolator.class, h);
                           XposedHelpers.findAndHookMethod(action, "update",
                                   int.class, int.class, int.class, Interpolator.class, h);
-                          XposedBridge.log(TAG + "hook RecyclerView.Action OK");
                       } catch (Throwable t) {
                           XposedBridge.log(TAG + "hook Action 失败: " + t);
                       }
                   }
               }
           
-              private void hookScroller(Class<?> c, final String name, final Interpolator spring) {
+              // ================= 悬浮球 + 设置菜单 =================
+          
+              private void hookUi() {
+                  try {
+                      XposedHelpers.findAndHookMethod(Activity.class, "onCreate", Bundle.class,
+                              new XC_MethodHook() {
+                                  @Override
+                                  protected void afterHookedMethod(MethodHookParam p) {
+                                      Activity a = (Activity) p.thisObject;
+                                      loadCfg(a);
+                                      if (toasted) return;
+                                      toasted = true;
+                                      try {
+                                          Toast.makeText(a, "弹簧动画模块已加载，可在抖音“设置”页底部打开弹簧设置",
+                                                  Toast.LENGTH_LONG).show();
+                                      } catch (Throwable ignored) { }
+                                  }
+                              });
+                      XposedHelpers.findAndHookMethod(Activity.class, "onResume",
+                              new XC_MethodHook() {
+                                  @Override
+                                  protected void afterHookedMethod(MethodHookParam p) {
+                                      try {
+                                          Activity a = (Activity) p.thisObject;
+                                          loadCfg(a);
+                                          scheduleEntryCheck(a);
+                                      } catch (Throwable t) {
+                                          XposedBridge.log(TAG + "entry 失败: " + t);
+                                      }
+                                  }
+                              });
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "hookUi 失败: " + t);
+                  }
+              }
+          
+              private static int dp(Context c, int v) {
+                  return (int) (v * c.getResources().getDisplayMetrics().density + 0.5f);
+              }
+          
+              private static void loadCfg(Context c) {
+                  if (cfgLoaded) return;
+                  cfgLoaded = true;
+                  try {
+                      SharedPreferences sp = c.getSharedPreferences(PREF, 0);
+                      enabled = sp.getBoolean("enabled", true);
+                      durMs = sp.getInt("durMs", DEF_DUR_MS);
+                      bounce = sp.getFloat("bounce", DEF_BOUNCE);
+                      curve = buildCurve(bounce);
+                  } catch (Throwable ignored) { }
+              }
+          
+              private static void saveCfg(Context c) {
+                  try {
+                      c.getSharedPreferences(PREF, 0).edit()
+                              .putBoolean("enabled", enabled)
+                              .putInt("durMs", durMs)
+                              .putFloat("bounce", bounce)
+                              .apply();
+                  } catch (Throwable ignored) { }
+              }
+          
+              private static void collectMarkers(View v, boolean[] found) {
+                  if (v.getVisibility() != View.VISIBLE) return;
+                  if (v instanceof TextView) {
+                      CharSequence t = ((TextView) v).getText();
+                      if (t != null) {
+                          String x = t.toString().trim();
+                          for (int i = 0; i < MARKERS.length; i++) {
+                              if (x.equals(MARKERS[i])) found[i] = true;
+                          }
+                      }
+                  }
+                  if (v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) collectMarkers(g.getChildAt(i), found);
+                  }
+              }
+          
+              /** 通过页面上的文字（账号与安全/隐私设置/通用设置）识别抖音设置页，不依赖混淆后的类名 */
+              private static boolean isSettingsPage(View root) {
+                  boolean[] found = new boolean[MARKERS.length];
+                  collectMarkers(root, found);
+                  int n = 0;
+                  for (boolean f : found) if (f) n++;
+                  return n >= 2;
+              }
+          
+              private static void scheduleEntryCheck(final Activity a) {
+                  View decor = a.getWindow().getDecorView();
+                  if (!(decor instanceof FrameLayout)) return;
+                  final FrameLayout fl = (FrameLayout) decor;
+                  if (fl.findViewWithTag(ENTRY_TAG) != null) return;
+                  final int[] tries = {0};
+                  Runnable r = new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              if (a.isFinishing() || fl.findViewWithTag(ENTRY_TAG) != null) return;
+                              if (isSettingsPage(fl)) {
+                                  addEntry(a, fl);
+                                  XposedBridge.log(TAG + "已在设置页添加入口: " + a.getClass().getName());
+                                  return;
+                              }
+                          } catch (Throwable ignored) { }
+                          if (++tries[0] < 8) fl.postDelayed(this, 500);
+                      }
+                  };
+                  fl.postDelayed(r, 400);
+              }
+          
+              private static void addEntry(final Activity a, FrameLayout fl) {
+                  TextView bar = new TextView(a);
+                  bar.setTag(ENTRY_TAG);
+                  bar.setText("弹簧动画设置  ›");
+                  bar.setTextColor(Color.WHITE);
+                  bar.setTextSize(15);
+                  bar.setGravity(Gravity.CENTER);
+                  bar.setPadding(dp(a, 24), dp(a, 11), dp(a, 24), dp(a, 11));
+                  GradientDrawable bg = new GradientDrawable();
+                  bg.setColor(0xEE3366FF);
+                  bg.setCornerRadius(dp(a, 24));
+                  bar.setBackground(bg);
+                  bar.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) { showMenu(a); }
+                  });
+                  FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                          FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+                  lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+                  lp.bottomMargin = dp(a, 64);
+                  fl.addView(bar, lp);
+              }
+          
+              private interface FloatSetter {
+                  void set(float v);
+              }
+          
+              private static void addSlider(final Activity a, LinearLayout root, final String name,
+                                            final float min, final float max, final float step,
+                                            float cur, final FloatSetter setter) {
+                  final TextView label = new TextView(a);
+                  label.setTextColor(0xFF333333);
+                  label.setTextSize(14);
+                  label.setPadding(0, dp(a, 14), 0, 0);
+                  final String fmt = step >= 1f ? "%s：%.0f" : "%s：%.2f";
+                  label.setText(String.format(Locale.US, fmt, name, cur));
+                  SeekBar sb = new SeekBar(a);
+                  sb.setMax(Math.round((max - min) / step));
+                  sb.setProgress(Math.round((cur - min) / step));
+                  sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                          float v = min + p * step;
+                          label.setText(String.format(Locale.US, fmt, name, v));
+                          if (fromUser) {
+                              setter.set(v);
+                              saveCfg(a);
+                          }
+                      }
+          
+                      @Override
+                      public void onStartTrackingTouch(SeekBar s) { }
+          
+                      @Override
+                      public void onStopTrackingTouch(SeekBar s) { }
+                  });
+                  root.addView(label);
+                  root.addView(sb, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+              }
+          
+              private static TextView button(Activity a, String text, View.OnClickListener l) {
+                  TextView t = new TextView(a);
+                  t.setText(text);
+                  t.setTextColor(0xFF1A5CFF);
+                  t.setTextSize(15);
+                  t.setGravity(Gravity.CENTER);
+                  t.setPadding(0, dp(a, 10), 0, dp(a, 10));
+                  t.setOnClickListener(l);
+                  t.setLayoutParams(new LinearLayout.LayoutParams(0,
+                          LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                  return t;
+              }
+          
+              private static void showMenu(final Activity a) {
+                  if (menuShowing) return;
+                  try {
+                      final Dialog d = new Dialog(a);
+                      d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+          
+                      LinearLayout root = new LinearLayout(a);
+                      root.setOrientation(LinearLayout.VERTICAL);
+                      root.setPadding(dp(a, 20), dp(a, 18), dp(a, 20), dp(a, 8));
+                      GradientDrawable bg = new GradientDrawable();
+                      bg.setColor(0xFFFFFFFF);
+                      bg.setCornerRadius(dp(a, 16));
+                      root.setBackground(bg);
+          
+                      TextView title = new TextView(a);
+                      title.setText("弹簧过渡动画设置");
+                      title.setTextColor(0xFF222222);
+                      title.setTextSize(18);
+                      title.setTypeface(null, android.graphics.Typeface.BOLD);
+                      root.addView(title);
+          
+                      Switch sw = new Switch(a);
+                      sw.setText("启用弹簧动画");
+                      sw.setTextColor(0xFF222222);
+                      sw.setChecked(enabled);
+                      sw.setPadding(0, dp(a, 12), 0, 0);
+                      sw.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+                          @Override
+                          public void onCheckedChanged(CompoundButton b, boolean c) {
+                              enabled = c;
+                              saveCfg(a);
+                          }
+                      });
+                      root.addView(sw);
+          
+                      addSlider(a, root, "翻页时长（毫秒，越大越慢）", 150f, 800f, 10f, durMs,
+                              new FloatSetter() {
+                                  @Override
+                                  public void set(float v) { durMs = Math.round(v); }
+                              });
+                      addSlider(a, root, "回弹幅度（0 = 无回弹）", 0f, 0.5f, 0.01f, bounce,
+                              new FloatSetter() {
+                                  @Override
+                                  public void set(float v) {
+                                      bounce = v;
+                                      curve = buildCurve(v);
+                                  }
+                              });
+          
+                      TextView tip = new TextView(a);
+                      tip.setText("调整后关闭本窗口，直接上下滑动视频即可看到效果");
+                      tip.setTextColor(0xFF888888);
+                      tip.setTextSize(12);
+                      tip.setPadding(0, dp(a, 12), 0, 0);
+                      root.addView(tip);
+          
+                      LinearLayout row = new LinearLayout(a);
+                      row.setOrientation(LinearLayout.HORIZONTAL);
+                      row.setPadding(0, dp(a, 10), 0, 0);
+                      row.addView(button(a, "恢复默认", new View.OnClickListener() {
+                          @Override
+                          public void onClick(View v) {
+                              enabled = true;
+                              durMs = DEF_DUR_MS;
+                              bounce = DEF_BOUNCE;
+                              curve = buildCurve(DEF_BOUNCE);
+                              saveCfg(a);
+                              d.dismiss();
+                              showMenu(a);
+                          }
+                      }));
+                      row.addView(button(a, "关闭", new View.OnClickListener() {
+                          @Override
+                          public void onClick(View v) { d.dismiss(); }
+                      }));
+                      root.addView(row);
+          
+                      d.setContentView(root);
+                      d.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                      d.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+                          @Override
+                          public void onDismiss(android.content.DialogInterface di) { menuShowing = false; }
+                      });
+                      menuShowing = true;
+                      d.show();
+          
+                      WindowManager.LayoutParams wl = new WindowManager.LayoutParams();
+                      wl.copyFrom(d.getWindow().getAttributes());
+                      wl.width = (int) (a.getResources().getDisplayMetrics().widthPixels * 0.88f);
+                      d.getWindow().setAttributes(wl);
+                  } catch (Throwable t) {
+                      menuShowing = false;
+                      XposedBridge.log(TAG + "showMenu 失败: " + t);
+                  }
+              }
+          
+              // ================= 滚动 Hook =================
+          
+              private void hookScroller(Class<?> c, final String name) {
                   try {
                       XposedHelpers.findAndHookMethod(c, "startScroll",
                               int.class, int.class, int.class, int.class, int.class,
@@ -228,24 +512,22 @@ jobs:
                                   protected void beforeHookedMethod(MethodHookParam p) {
                                       int dx = (int) p.args[2];
                                       int dy = (int) p.args[3];
-                                      logCaller(name + ".startScroll", dx, dy);
-                                      if (dy == 0 || dx != 0) return;
+                                      if (DEBUG) logCaller(name + ".startScroll", dx, dy);
+                                      if (!isPageScroll(dx, dy)) return;
                                       try {
-                                          XposedHelpers.setObjectField(p.thisObject, "mInterpolator", spring);
+                                          XposedHelpers.setObjectField(p.thisObject, "mInterpolator", SPRING);
                                       } catch (Throwable t) {
                                           XposedBridge.log(TAG + "设置 mInterpolator 失败: " + t);
                                           return;
                                       }
-                                      p.args[4] = scale((int) p.args[4]);
+                                      p.args[4] = pageDuration(dy);
                                   }
                               });
-                      XposedBridge.log(TAG + "hook " + name + ".startScroll OK");
                   } catch (Throwable t) {
                       XposedBridge.log(TAG + "hook " + name + " 失败: " + t);
                   }
               }
           
-              /** 每种调用来源只记录一次，用来定位抖音实际用的是哪个类 */
               private static void logCaller(String what, int dx, int dy) {
                   try {
                       StackTraceElement[] st = new Throwable().getStackTrace();
@@ -268,41 +550,42 @@ jobs:
                   } catch (Throwable ignored) { }
               }
           
-              private static int scale(int duration) {
-                  if (duration == UNDEFINED_DURATION || duration <= 0) return duration;
-                  return (int) (duration * DURATION_SCALE);
+              /** 只处理竖向、距离足够大的滚动（翻页和回弹），小的滚动保持原样 */
+              private static boolean isPageScroll(int dx, int dy) {
+                  if (!enabled || dx != 0) return false;
+                  float density = android.content.res.Resources.getSystem().getDisplayMetrics().density;
+                  return Math.abs(dy) >= 24 * density;
               }
           
-              /** 欠阻尼弹簧：f(t) = 1 - e^(-k t) * cos(w t)，t=1 时收敛到 1 */
+              /** 时长随距离缩放：整页翻动用满时长，距离短（拖一点点松手回弹）则相应缩短 */
+              private static int pageDuration(int dy) {
+                  float h = android.content.res.Resources.getSystem().getDisplayMetrics().heightPixels;
+                  float frac = Math.min(1f, Math.abs(dy) / h);
+                  return Math.max(120, Math.round(durMs * (0.45f + 0.55f * frac)));
+              }
+          
+              /**
+               * 曲线按你提供的参考录屏逐帧测得：起步迅速、后段平缓减速（贝塞尔 0.15,0.3,0.7,1）。
+               * bounce>0 时终点控制点上移，产生一次轻微的越过再回落。
+               */
+              static Interpolator buildCurve(float bounce) {
+                  return new PathInterpolator(0.15f, 0.3f, 0.7f, 1f + bounce);
+              }
+          
               static class SpringInterpolator implements Interpolator {
-                  private final float k;
-                  private final float w;
-          
-                  SpringInterpolator(float damping, float frequency) {
-                      this.k = 4f + damping * 8f;
-                      this.w = (float) (2 * Math.PI * frequency * 2f);
-                  }
-          
                   @Override
                   public float getInterpolation(float t) {
                       if (t <= 0f) return 0f;
                       if (t >= 1f) return 1f;
-                      return (float) (1.0 - Math.exp(-k * t) * Math.cos(w * t));
+                      if (!enabled) {
+                          float x = t - 1f;
+                          return x * x * x * x * x + 1f;
+                      }
+                      return curve.getInterpolation(t);
                   }
               }
           }
           EOF_X
-      - name: Apply parameters
-        env:
-          DUR: ${{ inputs.duration || '2.5' }}
-          FRQ: ${{ inputs.frequency || '1.0' }}
-          DMP: ${{ inputs.damping || '0.55' }}
-        run: |
-          F=proj/app/src/main/java/com/example/douyinspring/MainHook.java
-          sed -i "s/DURATION_SCALE = [0-9.]*f;/DURATION_SCALE = ${DUR}f;/" $F
-          sed -i "s/FREQUENCY = [0-9.]*f;/FREQUENCY = ${FRQ}f;/" $F
-          sed -i "s/DAMPING = [0-9.]*f;/DAMPING = ${DMP}f;/" $F
-          grep -nE "DURATION_SCALE =|FREQUENCY =|DAMPING =" $F
       - name: Build
         working-directory: proj
         run: gradle assembleDebug --no-daemon
