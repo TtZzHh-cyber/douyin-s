@@ -1,6 +1,16 @@
 name: Build APK
 on:
   workflow_dispatch:
+    inputs:
+      duration:
+        description: '动画时长倍数（越大越慢，默认2.5）'
+        default: '2.5'
+      frequency:
+        description: '回弹频率（越小回弹越慢越松，默认1.0）'
+        default: '1.0'
+      damping:
+        description: '阻尼（越大回弹越小，默认0.55）'
+        default: '0.55'
   push:
 jobs:
   build:
@@ -282,10 +292,21 @@ jobs:
               }
           }
           EOF_X
+      - name: Apply parameters
+        env:
+          DUR: ${{ inputs.duration || '2.5' }}
+          FRQ: ${{ inputs.frequency || '1.0' }}
+          DMP: ${{ inputs.damping || '0.55' }}
+        run: |
+          F=proj/app/src/main/java/com/example/douyinspring/MainHook.java
+          sed -i "s/DURATION_SCALE = [0-9.]*f;/DURATION_SCALE = ${DUR}f;/" $F
+          sed -i "s/FREQUENCY = [0-9.]*f;/FREQUENCY = ${FRQ}f;/" $F
+          sed -i "s/DAMPING = [0-9.]*f;/DAMPING = ${DMP}f;/" $F
+          grep -nE "DURATION_SCALE =|FREQUENCY =|DAMPING =" $F
       - name: Build
         working-directory: proj
         run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
-          name: DouyinSpring-apk-v2
+          name: DouyinSpring-apk
           path: proj/app/build/outputs/apk/debug/app-debug.apk
