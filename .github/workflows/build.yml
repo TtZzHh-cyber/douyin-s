@@ -1,0 +1,227 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Generate project files
+        run: |
+          set -e
+          mkdir -p proj/app/src/main/java/com/example/douyinspring proj/app/src/main/assets proj/app/src/main/res/values
+          cat > proj/settings.gradle <<'EOF_X'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url 'https://api.xposed.info/' }
+              }
+          }
+          rootProject.name = 'DouyinSpring'
+          include ':app'
+          EOF_X
+          cat > proj/build.gradle <<'EOF_X'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF_X
+          cat > proj/gradle.properties <<'EOF_X'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_X
+          cat > proj/app/build.gradle <<'EOF_X'
+          plugins { id 'com.android.application' }
+          
+          android {
+              namespace 'com.example.douyinspring'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.example.douyinspring'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          
+          dependencies {
+              compileOnly 'de.robv.android.xposed:api:82'
+          }
+          EOF_X
+          cat > proj/app/src/main/AndroidManifest.xml <<'EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="抖音过渡动画"
+                  android:allowBackup="false">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="抖音上下滑动弹簧过渡动画" />
+                  <meta-data android:name="xposedminversion" android:value="82" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
+              </application>
+          </manifest>
+          EOF_X
+          cat > proj/app/src/main/res/values/arrays.xml <<'EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposed_scope">
+                  <item>com.ss.android.ugc.aweme</item>
+              </string-array>
+          </resources>
+          EOF_X
+          cat > proj/app/src/main/assets/xposed_init <<'EOF_X'
+          com.example.douyinspring.MainHook
+          EOF_X
+          cat > proj/app/src/main/java/com/example/douyinspring/MainHook.java <<'EOF_X'
+          package com.example.douyinspring;
+          
+          import android.view.animation.Interpolator;
+          
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+          
+          /**
+           * 抖音上下滑动翻页 -> 弹簧回弹过渡动画
+           * 对应 iOS 插件：hook 视频流列表，用 usingSpringWithDamping 的弹簧动画替换翻页动画。
+           */
+          public class MainHook implements IXposedHookLoadPackage {
+          
+              private static final String TAG = "[DouyinSpring] ";
+          
+              // ===== 可调参数（对应 iOS 的 damping / velocity）=====
+              // 阻尼：越大回弹越小。0.5~0.9 比较自然
+              private static final float DAMPING = 0.55f;
+              // 振动频率：越大回弹越快
+              private static final float FREQUENCY = 1.1f;
+              // 时长倍数（仅当原动画有明确时长时生效）
+              private static final float DURATION_SCALE = 1.6f;
+          
+              // ===== 需要按抖音版本调整的类名 =====
+              // 抖音若没有混淆 androidx，可直接用默认值。
+              // 若被混淆，反编译 APK 找到 RecyclerView 及其 SmoothScroller$Action 的混淆名后替换这里。
+              private static final String RV_CLASS = "androidx.recyclerview.widget.RecyclerView";
+              private static final String ACTION_CLASS =
+                      "androidx.recyclerview.widget.RecyclerView$SmoothScroller$Action";
+          
+              private static final int UNDEFINED_DURATION = Integer.MIN_VALUE;
+          
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+                  if (!"com.ss.android.ugc.aweme".equals(lpparam.packageName)) return;
+          
+                  ClassLoader cl = lpparam.classLoader;
+                  Interpolator spring = new SpringInterpolator(DAMPING, FREQUENCY);
+          
+                  Class<?> rv = XposedHelpers.findClassIfExists(RV_CLASS, cl);
+                  Class<?> action = XposedHelpers.findClassIfExists(ACTION_CLASS, cl);
+          
+                  if (rv == null && action == null) {
+                      XposedBridge.log(TAG + "找不到 RecyclerView 类，可能被混淆，请修改 MainHook 中的类名");
+                      return;
+                  }
+          
+                  // 1) RecyclerView.smoothScrollBy(int dx, int dy, Interpolator, int duration)
+                  if (rv != null) {
+                      try {
+                          XposedHelpers.findAndHookMethod(rv, "smoothScrollBy",
+                                  int.class, int.class, Interpolator.class, int.class,
+                                  new XC_MethodHook() {
+                                      @Override
+                                      protected void beforeHookedMethod(MethodHookParam p) {
+                                          int dx = (int) p.args[0];
+                                          int dy = (int) p.args[1];
+                                          if (dy == 0 || dx != 0) return; // 只处理纵向翻页
+                                          p.args[2] = spring;
+                                          p.args[3] = scale((int) p.args[3]);
+                                      }
+                                  });
+                          XposedBridge.log(TAG + "hook smoothScrollBy OK");
+                      } catch (Throwable t) {
+                          XposedBridge.log(TAG + "hook smoothScrollBy 失败: " + t);
+                      }
+                  }
+          
+                  // 2) SmoothScroller.Action 构造与 update（PagerSnapHelper 走这条路径）
+                  if (action != null) {
+                      try {
+                          XposedHelpers.findAndHookConstructor(action,
+                                  int.class, int.class, int.class, Interpolator.class,
+                                  new XC_MethodHook() {
+                                      @Override
+                                      protected void beforeHookedMethod(MethodHookParam p) {
+                                          int dx = (int) p.args[0];
+                                          int dy = (int) p.args[1];
+                                          if (dy == 0 || dx != 0) return;
+                                          p.args[2] = scale((int) p.args[2]);
+                                          p.args[3] = spring;
+                                      }
+                                  });
+                          XposedHelpers.findAndHookMethod(action, "update",
+                                  int.class, int.class, int.class, Interpolator.class,
+                                  new XC_MethodHook() {
+                                      @Override
+                                      protected void beforeHookedMethod(MethodHookParam p) {
+                                          int dx = (int) p.args[0];
+                                          int dy = (int) p.args[1];
+                                          if (dy == 0 || dx != 0) return;
+                                          p.args[2] = scale((int) p.args[2]);
+                                          p.args[3] = spring;
+                                      }
+                                  });
+                          XposedBridge.log(TAG + "hook Action OK");
+                      } catch (Throwable t) {
+                          XposedBridge.log(TAG + "hook Action 失败: " + t);
+                      }
+                  }
+              }
+          
+              private static int scale(int duration) {
+                  if (duration == UNDEFINED_DURATION || duration <= 0) return duration;
+                  return (int) (duration * DURATION_SCALE);
+              }
+          
+              /** 欠阻尼弹簧：f(t) = 1 - e^(-k t) * cos(2π·freq·t)，t=1 时收敛到 1 */
+              static class SpringInterpolator implements Interpolator {
+                  private final float k;
+                  private final float w;
+          
+                  SpringInterpolator(float damping, float frequency) {
+                      // damping 越大衰减越快
+                      this.k = 4f + damping * 8f;
+                      this.w = (float) (2 * Math.PI * frequency * 2f);
+                  }
+          
+                  @Override
+                  public float getInterpolation(float t) {
+                      if (t <= 0f) return 0f;
+                      if (t >= 1f) return 1f;
+                      return (float) (1.0 - Math.exp(-k * t) * Math.cos(w * t));
+                  }
+              }
+          }
+          EOF_X
+      - name: Build
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DouyinSpring-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
