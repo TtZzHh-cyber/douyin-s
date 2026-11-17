@@ -90,7 +90,15 @@ jobs:
           cat > proj/app/src/main/java/com/example/douyinspring/MainHook.java <<'EOF_X'
           package com.example.douyinspring;
           
+          import android.app.Activity;
+          import android.os.Bundle;
           import android.view.animation.Interpolator;
+          import android.widget.OverScroller;
+          import android.widget.Scroller;
+          import android.widget.Toast;
+          
+          import java.util.HashSet;
+          import java.util.Set;
           
           import de.robv.android.xposed.IXposedHookLoadPackage;
           import de.robv.android.xposed.XC_MethodHook;
@@ -99,46 +107,64 @@ jobs:
           import de.robv.android.xposed.callbacks.XC_LoadPackage;
           
           /**
-           * 抖音上下滑动翻页 -> 弹簧回弹过渡动画
-           * 对应 iOS 插件：hook 视频流列表，用 usingSpringWithDamping 的弹簧动画替换翻页动画。
+           * 抖音上下滑动翻页 -> 弹簧回弹过渡动画 (v2)
+           * 对应 iOS 插件：用 usingSpringWithDamping 的弹簧动画替换翻页动画。
            */
           public class MainHook implements IXposedHookLoadPackage {
           
               private static final String TAG = "[DouyinSpring] ";
           
-              // ===== 可调参数（对应 iOS 的 damping / velocity）=====
-              // 阻尼：越大回弹越小。0.5~0.9 比较自然
-              private static final float DAMPING = 0.55f;
-              // 振动频率：越大回弹越快
-              private static final float FREQUENCY = 1.1f;
-              // 时长倍数（仅当原动画有明确时长时生效）
-              private static final float DURATION_SCALE = 1.6f;
+              // ===== 可调参数 =====
+              private static final float DAMPING = 0.55f;      // 越大回弹越小
+              private static final float FREQUENCY = 1.1f;     // 越大回弹越快
+              private static final float DURATION_SCALE = 1.5f; // 时长倍数
           
-              // ===== 需要按抖音版本调整的类名 =====
-              // 抖音若没有混淆 androidx，可直接用默认值。
-              // 若被混淆，反编译 APK 找到 RecyclerView 及其 SmoothScroller$Action 的混淆名后替换这里。
               private static final String RV_CLASS = "androidx.recyclerview.widget.RecyclerView";
               private static final String ACTION_CLASS =
                       "androidx.recyclerview.widget.RecyclerView$SmoothScroller$Action";
-          
               private static final int UNDEFINED_DURATION = Integer.MIN_VALUE;
+          
+              private static boolean toasted = false;
+              private static final Set<String> seen = new HashSet<>();
           
               @Override
               public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
                   if (!"com.ss.android.ugc.aweme".equals(lpparam.packageName)) return;
+                  XposedBridge.log(TAG + "模块已注入, process=" + lpparam.processName);
           
-                  ClassLoader cl = lpparam.classLoader;
-                  Interpolator spring = new SpringInterpolator(DAMPING, FREQUENCY);
+                  final Interpolator spring = new SpringInterpolator(DAMPING, FREQUENCY);
           
-                  Class<?> rv = XposedHelpers.findClassIfExists(RV_CLASS, cl);
-                  Class<?> action = XposedHelpers.findClassIfExists(ACTION_CLASS, cl);
-          
-                  if (rv == null && action == null) {
-                      XposedBridge.log(TAG + "找不到 RecyclerView 类，可能被混淆，请修改 MainHook 中的类名");
-                      return;
+                  // 0) 启动提示：用来确认模块真的生效
+                  if (lpparam.packageName.equals(lpparam.processName)) {
+                      try {
+                          XposedHelpers.findAndHookMethod(Activity.class, "onCreate", Bundle.class,
+                                  new XC_MethodHook() {
+                                      @Override
+                                      protected void afterHookedMethod(MethodHookParam p) {
+                                          if (toasted) return;
+                                          toasted = true;
+                                          try {
+                                              Toast.makeText((Activity) p.thisObject,
+                                                      "弹簧动画模块已加载", Toast.LENGTH_LONG).show();
+                                          } catch (Throwable ignored) { }
+                                      }
+                                  });
+                      } catch (Throwable t) {
+                          XposedBridge.log(TAG + "toast hook 失败: " + t);
+                      }
                   }
           
-                  // 1) RecyclerView.smoothScrollBy(int dx, int dy, Interpolator, int duration)
+                  // 1) 系统 Scroller / OverScroller（老式 ViewPager 翻页走这里）
+                  hookScroller(Scroller.class, "Scroller", spring);
+                  hookScroller(OverScroller.class, "OverScroller", spring);
+          
+                  // 2) RecyclerView（ViewPager2 / PagerSnapHelper 走这里）
+                  ClassLoader cl = lpparam.classLoader;
+                  Class<?> rv = XposedHelpers.findClassIfExists(RV_CLASS, cl);
+                  Class<?> action = XposedHelpers.findClassIfExists(ACTION_CLASS, cl);
+                  if (rv == null && action == null) {
+                      XposedBridge.log(TAG + "找不到 RecyclerView 类（可能被混淆）");
+                  }
                   if (rv != null) {
                       try {
                           XposedHelpers.findAndHookMethod(rv, "smoothScrollBy",
@@ -148,49 +174,88 @@ jobs:
                                       protected void beforeHookedMethod(MethodHookParam p) {
                                           int dx = (int) p.args[0];
                                           int dy = (int) p.args[1];
-                                          if (dy == 0 || dx != 0) return; // 只处理纵向翻页
+                                          logCaller("RV.smoothScrollBy", dx, dy);
+                                          if (dy == 0 || dx != 0) return;
                                           p.args[2] = spring;
                                           p.args[3] = scale((int) p.args[3]);
                                       }
                                   });
-                          XposedBridge.log(TAG + "hook smoothScrollBy OK");
+                          XposedBridge.log(TAG + "hook RecyclerView.smoothScrollBy OK");
                       } catch (Throwable t) {
                           XposedBridge.log(TAG + "hook smoothScrollBy 失败: " + t);
                       }
                   }
-          
-                  // 2) SmoothScroller.Action 构造与 update（PagerSnapHelper 走这条路径）
                   if (action != null) {
                       try {
+                          XC_MethodHook h = new XC_MethodHook() {
+                              @Override
+                              protected void beforeHookedMethod(MethodHookParam p) {
+                                  int dx = (int) p.args[0];
+                                  int dy = (int) p.args[1];
+                                  logCaller("RV.Action", dx, dy);
+                                  if (dy == 0 || dx != 0) return;
+                                  p.args[2] = scale((int) p.args[2]);
+                                  p.args[3] = spring;
+                              }
+                          };
                           XposedHelpers.findAndHookConstructor(action,
-                                  int.class, int.class, int.class, Interpolator.class,
-                                  new XC_MethodHook() {
-                                      @Override
-                                      protected void beforeHookedMethod(MethodHookParam p) {
-                                          int dx = (int) p.args[0];
-                                          int dy = (int) p.args[1];
-                                          if (dy == 0 || dx != 0) return;
-                                          p.args[2] = scale((int) p.args[2]);
-                                          p.args[3] = spring;
-                                      }
-                                  });
+                                  int.class, int.class, int.class, Interpolator.class, h);
                           XposedHelpers.findAndHookMethod(action, "update",
-                                  int.class, int.class, int.class, Interpolator.class,
-                                  new XC_MethodHook() {
-                                      @Override
-                                      protected void beforeHookedMethod(MethodHookParam p) {
-                                          int dx = (int) p.args[0];
-                                          int dy = (int) p.args[1];
-                                          if (dy == 0 || dx != 0) return;
-                                          p.args[2] = scale((int) p.args[2]);
-                                          p.args[3] = spring;
-                                      }
-                                  });
-                          XposedBridge.log(TAG + "hook Action OK");
+                                  int.class, int.class, int.class, Interpolator.class, h);
+                          XposedBridge.log(TAG + "hook RecyclerView.Action OK");
                       } catch (Throwable t) {
                           XposedBridge.log(TAG + "hook Action 失败: " + t);
                       }
                   }
+              }
+          
+              private void hookScroller(Class<?> c, final String name, final Interpolator spring) {
+                  try {
+                      XposedHelpers.findAndHookMethod(c, "startScroll",
+                              int.class, int.class, int.class, int.class, int.class,
+                              new XC_MethodHook() {
+                                  @Override
+                                  protected void beforeHookedMethod(MethodHookParam p) {
+                                      int dx = (int) p.args[2];
+                                      int dy = (int) p.args[3];
+                                      logCaller(name + ".startScroll", dx, dy);
+                                      if (dy == 0 || dx != 0) return;
+                                      try {
+                                          XposedHelpers.setObjectField(p.thisObject, "mInterpolator", spring);
+                                      } catch (Throwable t) {
+                                          XposedBridge.log(TAG + "设置 mInterpolator 失败: " + t);
+                                          return;
+                                      }
+                                      p.args[4] = scale((int) p.args[4]);
+                                  }
+                              });
+                      XposedBridge.log(TAG + "hook " + name + ".startScroll OK");
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "hook " + name + " 失败: " + t);
+                  }
+              }
+          
+              /** 每种调用来源只记录一次，用来定位抖音实际用的是哪个类 */
+              private static void logCaller(String what, int dx, int dy) {
+                  try {
+                      StackTraceElement[] st = new Throwable().getStackTrace();
+                      StringBuilder sb = new StringBuilder();
+                      int n = 0;
+                      for (StackTraceElement e : st) {
+                          String cn = e.getClassName();
+                          if (cn.startsWith("android.") || cn.startsWith("java.")
+                                  || cn.startsWith("de.robv") || cn.startsWith("LSP")
+                                  || cn.startsWith("org.lsposed") || cn.startsWith("com.example.douyinspring")) {
+                              continue;
+                          }
+                          sb.append("\n    ").append(cn).append('.').append(e.getMethodName());
+                          if (++n >= 4) break;
+                      }
+                      String key = what + sb;
+                      if (seen.add(key)) {
+                          XposedBridge.log(TAG + what + " dx=" + dx + " dy=" + dy + " 调用者:" + sb);
+                      }
+                  } catch (Throwable ignored) { }
               }
           
               private static int scale(int duration) {
@@ -198,13 +263,12 @@ jobs:
                   return (int) (duration * DURATION_SCALE);
               }
           
-              /** 欠阻尼弹簧：f(t) = 1 - e^(-k t) * cos(2π·freq·t)，t=1 时收敛到 1 */
+              /** 欠阻尼弹簧：f(t) = 1 - e^(-k t) * cos(w t)，t=1 时收敛到 1 */
               static class SpringInterpolator implements Interpolator {
                   private final float k;
                   private final float w;
           
                   SpringInterpolator(float damping, float frequency) {
-                      // damping 越大衰减越快
                       this.k = 4f + damping * 8f;
                       this.w = (float) (2 * Math.PI * frequency * 2f);
                   }
@@ -223,5 +287,5 @@ jobs:
         run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
-          name: DouyinSpring-apk
+          name: DouyinSpring-apk-v2
           path: proj/app/build/outputs/apk/debug/app-debug.apk
