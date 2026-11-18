@@ -50,8 +50,8 @@ jobs:
                   applicationId 'com.example.douyinspring'
                   minSdk 24
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '2.0'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_1_8
@@ -92,23 +92,17 @@ jobs:
           
           import android.app.Activity;
           import android.app.Dialog;
-          import android.content.ClipData;
-          import android.content.ClipboardManager;
           import android.content.Context;
           import android.content.SharedPreferences;
+          import android.content.res.Resources;
           import android.graphics.Color;
+          import android.graphics.Typeface;
           import android.graphics.drawable.ColorDrawable;
           import android.graphics.drawable.GradientDrawable;
-          import android.os.Bundle;
-          import android.os.Handler;
-          import android.os.Looper;
-          import android.util.DisplayMetrics;
           import android.view.Display;
           import android.view.Gravity;
-          import android.view.MotionEvent;
           import android.view.View;
           import android.view.ViewGroup;
-          import android.view.ViewConfiguration;
           import android.view.Window;
           import android.view.WindowManager;
           import android.view.animation.Interpolator;
@@ -121,11 +115,8 @@ jobs:
           import android.widget.SeekBar;
           import android.widget.Switch;
           import android.widget.TextView;
-          import android.widget.Toast;
           
-          import java.util.HashSet;
           import java.util.Locale;
-          import java.util.Set;
           import java.util.TreeSet;
           
           import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -135,140 +126,119 @@ jobs:
           import de.robv.android.xposed.callbacks.XC_LoadPackage;
           
           /**
-           * 抖音上下滑动翻页 -> 弹簧回弹过渡动画 (v6: 按参考录屏拟合的曲线)
+           * 抖音上下翻页过渡动画：按参考录屏拟合的减速曲线 + 可调回弹，
+           * 设置入口在抖音「设置」页底部。
            */
           public class MainHook implements IXposedHookLoadPackage {
           
+              private static final String PKG = "com.ss.android.ugc.aweme";
               private static final String TAG = "[DouyinSpring] ";
+              private static final String PREF = "douyin_spring_cfg";
               private static final String ENTRY_TAG = "ds_entry";
               private static final String[] MARKERS = {"账号与安全", "隐私设置", "通用设置"};
-              private static final String PREF = "douyin_spring_cfg";
           
-              private static final boolean DEBUG = false; // 关闭：避免每次滚动都生成堆栈造成卡顿
               private static final int DEF_DUR_MS = 320;
               private static final float DEF_BOUNCE = 0.15f;
           
-              // ===== 运行时可调参数（由菜单修改） =====
-              static volatile boolean enabled = true;
-              static volatile boolean highRefresh = true;
-              static volatile int durMs = DEF_DUR_MS;
-              static volatile float bounce = DEF_BOUNCE;
-              static volatile Interpolator curve = buildCurve(DEF_BOUNCE);
+              private static volatile boolean enabled = true;
+              private static volatile boolean highRefresh = true;
+              private static volatile int durMs = DEF_DUR_MS;
+              private static volatile float bounce = DEF_BOUNCE;
+              private static volatile Interpolator curve = buildCurve(DEF_BOUNCE);
           
               private static boolean cfgLoaded = false;
-              private static java.lang.ref.WeakReference<Activity> cur;
               private static boolean menuShowing = false;
-              private static boolean toasted = false;
           
-              private static final String RV_CLASS = "androidx.recyclerview.widget.RecyclerView";
-              private static final String ACTION_CLASS =
-                      "androidx.recyclerview.widget.RecyclerView$SmoothScroller$Action";
-              private static final int UNDEFINED_DURATION = Integer.MIN_VALUE;
-              private static final Set<String> seen = new HashSet<>();
-          
-              private static final Interpolator SPRING = new SpringInterpolator();
+              private static final Interpolator PAGE = new PageInterpolator();
           
               @Override
               public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-                  if (!"com.ss.android.ugc.aweme".equals(lpparam.packageName)) return;
-                  XposedBridge.log(TAG + "模块已注入, process=" + lpparam.processName);
-          
-                  if (lpparam.packageName.equals(lpparam.processName)) {
-                      hookUi();
-                  }
-          
-                  hookScroller(Scroller.class, "Scroller");
-                  hookScroller(OverScroller.class, "OverScroller");
-          
-                  ClassLoader cl = lpparam.classLoader;
-                  Class<?> rv = XposedHelpers.findClassIfExists(RV_CLASS, cl);
-                  Class<?> action = XposedHelpers.findClassIfExists(ACTION_CLASS, cl);
-                  if (rv == null && action == null) {
-                      XposedBridge.log(TAG + "找不到 RecyclerView 类（可能被混淆）");
-                  }
-                  if (rv != null) {
-                      try {
-                          XposedHelpers.findAndHookMethod(rv, "smoothScrollBy",
-                                  int.class, int.class, Interpolator.class, int.class,
-                                  new XC_MethodHook() {
-                                      @Override
-                                      protected void beforeHookedMethod(MethodHookParam p) {
-                                          int dx = (int) p.args[0];
-                                          int dy = (int) p.args[1];
-                                          if (DEBUG) logCaller("RV.smoothScrollBy", dx, dy);
-                                          if (!isPageScroll(dx, dy)) return;
-                                          p.args[2] = SPRING;
-                                          p.args[3] = pageDuration(dy);
-                                      }
-                                  });
-                      } catch (Throwable t) {
-                          XposedBridge.log(TAG + "hook smoothScrollBy 失败: " + t);
-                      }
-                  }
-                  if (action != null) {
-                      try {
-                          XC_MethodHook h = new XC_MethodHook() {
-                              @Override
-                              protected void beforeHookedMethod(MethodHookParam p) {
-                                  int dx = (int) p.args[0];
-                                  int dy = (int) p.args[1];
-                                  if (DEBUG) logCaller("RV.Action", dx, dy);
-                                  if (!isPageScroll(dx, dy)) return;
-                                  p.args[2] = pageDuration(dy);
-                                  p.args[3] = SPRING;
-                              }
-                          };
-                          XposedHelpers.findAndHookConstructor(action,
-                                  int.class, int.class, int.class, Interpolator.class, h);
-                          XposedHelpers.findAndHookMethod(action, "update",
-                                  int.class, int.class, int.class, Interpolator.class, h);
-                      } catch (Throwable t) {
-                          XposedBridge.log(TAG + "hook Action 失败: " + t);
-                      }
-                  }
+                  if (!PKG.equals(lpparam.packageName) || !PKG.equals(lpparam.processName)) return;
+                  hookScroller(Scroller.class);
+                  hookScroller(OverScroller.class);
+                  hookResume();
               }
           
-              // ================= 悬浮球 + 设置菜单 =================
+              // ================= 翻页动画 =================
           
-              private void hookUi() {
+              /** 抖音首页翻页（ViewPager）通过 Scroller.startScroll 滚动，替换其插值器和时长 */
+              private static void hookScroller(Class<?> c) {
                   try {
-                      XposedHelpers.findAndHookMethod(Activity.class, "onCreate", Bundle.class,
+                      XposedHelpers.findAndHookMethod(c, "startScroll",
+                              int.class, int.class, int.class, int.class, int.class,
                               new XC_MethodHook() {
                                   @Override
-                                  protected void afterHookedMethod(MethodHookParam p) {
-                                      Activity a = (Activity) p.thisObject;
-                                      loadCfg(a);
-                                      if (toasted) return;
-                                      toasted = true;
+                                  protected void beforeHookedMethod(MethodHookParam p) {
+                                      int dx = (int) p.args[2];
+                                      int dy = (int) p.args[3];
+                                      if (!isPageScroll(dx, dy)) return;
                                       try {
-                                          Toast.makeText(a, "弹簧动画模块已加载，可在抖音“设置”页底部打开弹簧设置",
-                                                  Toast.LENGTH_LONG).show();
-                                      } catch (Throwable ignored) { }
-                                  }
-                              });
-                      XposedHelpers.findAndHookMethod(Activity.class, "onResume",
-                              new XC_MethodHook() {
-                                  @Override
-                                  protected void afterHookedMethod(MethodHookParam p) {
-                                      try {
-                                          Activity a = (Activity) p.thisObject;
-                                          loadCfg(a);
-                                          cur = new java.lang.ref.WeakReference<Activity>(a);
-                                          scheduleEntryCheck(a);
-                                          applyHighRefresh(a);
+                                          XposedHelpers.setObjectField(p.thisObject, "mInterpolator", PAGE);
                                       } catch (Throwable t) {
-                                          XposedBridge.log(TAG + "entry 失败: " + t);
+                                          return;
                                       }
+                                      p.args[4] = pageDuration(dy);
                                   }
                               });
                   } catch (Throwable t) {
-                      XposedBridge.log(TAG + "hookUi 失败: " + t);
+                      XposedBridge.log(TAG + "hook " + c.getSimpleName() + " 失败: " + t);
                   }
               }
           
-              private static int dp(Context c, int v) {
-                  return (int) (v * c.getResources().getDisplayMetrics().density + 0.5f);
+              /** 只处理竖向、距离足够大的滚动（翻页和回弹），小的滚动保持原样 */
+              private static boolean isPageScroll(int dx, int dy) {
+                  if (!enabled || dx != 0) return false;
+                  return Math.abs(dy) >= 24 * Resources.getSystem().getDisplayMetrics().density;
               }
+          
+              /** 整页翻动用满时长，距离短（拖一点点松手回弹）则相应缩短 */
+              private static int pageDuration(int dy) {
+                  float h = Resources.getSystem().getDisplayMetrics().heightPixels;
+                  float frac = Math.min(1f, Math.abs(dy) / h);
+                  return Math.max(120, Math.round(durMs * (0.45f + 0.55f * frac)));
+              }
+          
+              /** 曲线由参考录屏逐帧拟合（贝塞尔 0.15, 0.3, 0.7, 1）；bounce>0 时产生轻微越过再回落 */
+              private static Interpolator buildCurve(float bounce) {
+                  return new PathInterpolator(0.15f, 0.3f, 0.7f, 1f + bounce);
+              }
+          
+              private static class PageInterpolator implements Interpolator {
+                  @Override
+                  public float getInterpolation(float t) {
+                      if (t <= 0f) return 0f;
+                      if (t >= 1f) return 1f;
+                      if (!enabled) { // 关闭后退回近似原生的减速曲线
+                          float x = t - 1f;
+                          return x * x * x * x * x + 1f;
+                      }
+                      return curve.getInterpolation(t);
+                  }
+              }
+          
+              // ================= Activity 钩子 =================
+          
+              private static void hookResume() {
+                  try {
+                      XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
+                          @Override
+                          protected void afterHookedMethod(MethodHookParam p) {
+                              try {
+                                  Activity a = (Activity) p.thisObject;
+                                  loadCfg(a);
+                                  applyHighRefresh(a);
+                                  scheduleEntryCheck(a);
+                              } catch (Throwable t) {
+                                  XposedBridge.log(TAG + "onResume 处理失败: " + t);
+                              }
+                          }
+                      });
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "hook onResume 失败: " + t);
+                  }
+              }
+          
+              // ================= 配置 =================
           
               private static void loadCfg(Context c) {
                   if (cfgLoaded) return;
@@ -294,6 +264,74 @@ jobs:
                   } catch (Throwable ignored) { }
               }
           
+              // ================= 刷新率 =================
+          
+              private static Display.Mode bestMode(Display d) {
+                  Display.Mode cur = d.getMode();
+                  Display.Mode best = cur;
+                  for (Display.Mode m : d.getSupportedModes()) {
+                      if (m.getPhysicalWidth() == cur.getPhysicalWidth()
+                              && m.getPhysicalHeight() == cur.getPhysicalHeight()
+                              && m.getRefreshRate() > best.getRefreshRate() + 0.5f) {
+                          best = m;
+                      }
+                  }
+                  return best;
+              }
+          
+              /** 请求该窗口使用屏幕支持的最高刷新率（部分系统会忽略此请求） */
+              private static void applyHighRefresh(Activity a) {
+                  if (!highRefresh) return;
+                  try {
+                      Window w = a.getWindow();
+                      Display.Mode best = bestMode(a.getWindowManager().getDefaultDisplay());
+                      WindowManager.LayoutParams lp = w.getAttributes();
+                      if (lp.preferredDisplayModeId != best.getModeId()
+                              || lp.preferredRefreshRate != best.getRefreshRate()) {
+                          lp.preferredDisplayModeId = best.getModeId();
+                          lp.preferredRefreshRate = best.getRefreshRate();
+                          w.setAttributes(lp);
+                      }
+                  } catch (Throwable ignored) { }
+              }
+          
+              private static void resetRefresh(Activity a) {
+                  try {
+                      Window w = a.getWindow();
+                      WindowManager.LayoutParams lp = w.getAttributes();
+                      lp.preferredDisplayModeId = 0;
+                      lp.preferredRefreshRate = 0f;
+                      w.setAttributes(lp);
+                  } catch (Throwable ignored) { }
+              }
+          
+              private static String refreshInfo(Activity a) {
+                  try {
+                      Display d = a.getWindowManager().getDefaultDisplay();
+                      Display.Mode cur = d.getMode();
+                      TreeSet<Integer> rates = new TreeSet<>();
+                      for (Display.Mode m : d.getSupportedModes()) {
+                          if (m.getPhysicalWidth() == cur.getPhysicalWidth()
+                                  && m.getPhysicalHeight() == cur.getPhysicalHeight()) {
+                              rates.add(Math.round(m.getRefreshRate()));
+                          }
+                      }
+                      StringBuilder sb = new StringBuilder("屏幕支持：");
+                      boolean first = true;
+                      for (int r : rates) {
+                          if (!first) sb.append(" / ");
+                          sb.append(r);
+                          first = false;
+                      }
+                      return sb.append(" Hz，当前 ").append(Math.round(d.getRefreshRate())).append(" Hz")
+                              .toString();
+                  } catch (Throwable t) {
+                      return "无法读取刷新率";
+                  }
+              }
+          
+              // ================= 设置页入口 =================
+          
               private static void collectMarkers(View v, boolean[] found) {
                   if (v.getVisibility() != View.VISIBLE) return;
                   if (v instanceof TextView) {
@@ -311,7 +349,7 @@ jobs:
                   }
               }
           
-              /** 通过页面上的文字（账号与安全/隐私设置/通用设置）识别抖音设置页，不依赖混淆后的类名 */
+              /** 通过页面文字识别抖音设置页，不依赖混淆后的类名 */
               private static boolean isSettingsPage(View root) {
                   boolean[] found = new boolean[MARKERS.length];
                   collectMarkers(root, found);
@@ -321,28 +359,26 @@ jobs:
               }
           
               private static void scheduleEntryCheck(final Activity a) {
-                  // 首页 MainActivity 的视图树非常大，反复遍历会造成掉帧，设置页不在这里，直接跳过
+                  // 首页视图树很大，遍历会掉帧；设置页不在首页 Activity 中，直接跳过
                   if (a.getClass().getName().endsWith(".main.MainActivity")) return;
                   View decor = a.getWindow().getDecorView();
                   if (!(decor instanceof FrameLayout)) return;
                   final FrameLayout fl = (FrameLayout) decor;
                   if (fl.findViewWithTag(ENTRY_TAG) != null) return;
                   final int[] tries = {0};
-                  Runnable r = new Runnable() {
+                  fl.postDelayed(new Runnable() {
                       @Override
                       public void run() {
                           try {
                               if (a.isFinishing() || fl.findViewWithTag(ENTRY_TAG) != null) return;
                               if (isSettingsPage(fl)) {
                                   addEntry(a, fl);
-                                  XposedBridge.log(TAG + "已在设置页添加入口: " + a.getClass().getName());
                                   return;
                               }
                           } catch (Throwable ignored) { }
                           if (++tries[0] < 4) fl.postDelayed(this, 600);
                       }
-                  };
-                  fl.postDelayed(r, 400);
+                  }, 400);
               }
           
               private static void addEntry(final Activity a, FrameLayout fl) {
@@ -368,18 +404,35 @@ jobs:
                   fl.addView(bar, lp);
               }
           
+              // ================= 设置面板 =================
+          
+              private static int dp(Context c, int v) {
+                  return (int) (v * c.getResources().getDisplayMetrics().density + 0.5f);
+              }
+          
               private interface FloatSetter {
                   void set(float v);
+              }
+          
+              private static void addSwitch(final Activity a, LinearLayout root, String text,
+                                            boolean checked, CompoundButton.OnCheckedChangeListener l) {
+                  Switch sw = new Switch(a);
+                  sw.setText(text);
+                  sw.setTextColor(0xFF222222);
+                  sw.setChecked(checked);
+                  sw.setPadding(0, dp(a, 12), 0, 0);
+                  sw.setOnCheckedChangeListener(l);
+                  root.addView(sw);
               }
           
               private static void addSlider(final Activity a, LinearLayout root, final String name,
                                             final float min, final float max, final float step,
                                             float cur, final FloatSetter setter) {
+                  final String fmt = step >= 1f ? "%s：%.0f" : "%s：%.2f";
                   final TextView label = new TextView(a);
                   label.setTextColor(0xFF333333);
                   label.setTextSize(14);
                   label.setPadding(0, dp(a, 14), 0, 0);
-                  final String fmt = step >= 1f ? "%s：%.0f" : "%s：%.2f";
                   label.setText(String.format(Locale.US, fmt, name, cur));
                   SeekBar sb = new SeekBar(a);
                   sb.setMax(Math.round((max - min) / step));
@@ -437,38 +490,27 @@ jobs:
                       title.setText("弹簧过渡动画设置");
                       title.setTextColor(0xFF222222);
                       title.setTextSize(18);
-                      title.setTypeface(null, android.graphics.Typeface.BOLD);
+                      title.setTypeface(null, Typeface.BOLD);
                       root.addView(title);
           
-                      Switch sw = new Switch(a);
-                      sw.setText("启用弹簧动画");
-                      sw.setTextColor(0xFF222222);
-                      sw.setChecked(enabled);
-                      sw.setPadding(0, dp(a, 12), 0, 0);
-                      sw.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-                          @Override
-                          public void onCheckedChanged(CompoundButton b, boolean c) {
-                              enabled = c;
-                              saveCfg(a);
-                          }
-                      });
-                      root.addView(sw);
-          
-                      Switch hr = new Switch(a);
-                      hr.setText("强制最高刷新率（更流畅，更费电）");
-                      hr.setTextColor(0xFF222222);
-                      hr.setChecked(highRefresh);
-                      hr.setPadding(0, dp(a, 12), 0, 0);
-                      hr.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-                          @Override
-                          public void onCheckedChanged(CompoundButton b, boolean c) {
-                              highRefresh = c;
-                              saveCfg(a);
-                              if (c) applyHighRefresh(a);
-                              else resetRefresh(a);
-                          }
-                      });
-                      root.addView(hr);
+                      addSwitch(a, root, "启用弹簧动画", enabled,
+                              new CompoundButton.OnCheckedChangeListener() {
+                                  @Override
+                                  public void onCheckedChanged(CompoundButton b, boolean c) {
+                                      enabled = c;
+                                      saveCfg(a);
+                                  }
+                              });
+                      addSwitch(a, root, "强制最高刷新率（更流畅，更费电）", highRefresh,
+                              new CompoundButton.OnCheckedChangeListener() {
+                                  @Override
+                                  public void onCheckedChanged(CompoundButton b, boolean c) {
+                                      highRefresh = c;
+                                      saveCfg(a);
+                                      if (c) applyHighRefresh(a);
+                                      else resetRefresh(a);
+                                  }
+                              });
           
                       TextView rate = new TextView(a);
                       rate.setText(refreshInfo(a));
@@ -497,18 +539,6 @@ jobs:
                       tip.setTextSize(12);
                       tip.setPadding(0, dp(a, 12), 0, 0);
                       root.addView(tip);
-          
-                      TextView dump = button(a, "排查残影：15 秒后复制页面结构", new View.OnClickListener() {
-                          @Override
-                          public void onClick(View v) {
-                              d.dismiss();
-                              scheduleDump(a);
-                          }
-                      });
-                      dump.setLayoutParams(new LinearLayout.LayoutParams(
-                              LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-                      dump.setPadding(0, dp(a, 14), 0, 0);
-                      root.addView(dump);
           
                       LinearLayout row = new LinearLayout(a);
                       row.setOrientation(LinearLayout.HORIZONTAL);
@@ -547,214 +577,6 @@ jobs:
                   } catch (Throwable t) {
                       menuShowing = false;
                       XposedBridge.log(TAG + "showMenu 失败: " + t);
-                  }
-              }
-          
-              // ================= 刷新率 =================
-          
-              private static Display.Mode bestMode(Display d) {
-                  Display.Mode cur = d.getMode();
-                  Display.Mode best = cur;
-                  for (Display.Mode m : d.getSupportedModes()) {
-                      if (m.getPhysicalWidth() == cur.getPhysicalWidth()
-                              && m.getPhysicalHeight() == cur.getPhysicalHeight()
-                              && m.getRefreshRate() > best.getRefreshRate() + 0.5f) {
-                          best = m;
-                      }
-                  }
-                  return best;
-              }
-          
-              /** 请求该窗口使用屏幕支持的最高刷新率（部分系统会忽略此请求） */
-              private static void applyHighRefresh(Activity a) {
-                  if (!highRefresh) return;
-                  try {
-                      Window w = a.getWindow();
-                      Display d = a.getWindowManager().getDefaultDisplay();
-                      Display.Mode best = bestMode(d);
-                      WindowManager.LayoutParams lp = w.getAttributes();
-                      if (lp.preferredDisplayModeId != best.getModeId()
-                              || lp.preferredRefreshRate != best.getRefreshRate()) {
-                          lp.preferredDisplayModeId = best.getModeId();
-                          lp.preferredRefreshRate = best.getRefreshRate();
-                          w.setAttributes(lp);
-                      }
-                  } catch (Throwable t) {
-                      XposedBridge.log(TAG + "高刷设置失败: " + t);
-                  }
-              }
-          
-              private static void resetRefresh(Activity a) {
-                  try {
-                      Window w = a.getWindow();
-                      WindowManager.LayoutParams lp = w.getAttributes();
-                      lp.preferredDisplayModeId = 0;
-                      lp.preferredRefreshRate = 0f;
-                      w.setAttributes(lp);
-                  } catch (Throwable ignored) { }
-              }
-          
-              private static String refreshInfo(Activity a) {
-                  try {
-                      Display d = a.getWindowManager().getDefaultDisplay();
-                      Display.Mode cur = d.getMode();
-                      TreeSet<Integer> rates = new TreeSet<>();
-                      for (Display.Mode m : d.getSupportedModes()) {
-                          if (m.getPhysicalWidth() == cur.getPhysicalWidth()
-                                  && m.getPhysicalHeight() == cur.getPhysicalHeight()) {
-                              rates.add(Math.round(m.getRefreshRate()));
-                          }
-                      }
-                      StringBuilder sb = new StringBuilder("屏幕支持：");
-                      boolean first = true;
-                      for (int r : rates) {
-                          if (!first) sb.append(" / ");
-                          sb.append(r);
-                          first = false;
-                      }
-                      sb.append(" Hz，当前 ").append(Math.round(d.getRefreshRate())).append(" Hz");
-                      return sb.toString();
-                  } catch (Throwable t) {
-                      return "无法读取刷新率";
-                  }
-              }
-          
-              // ================= 排查工具：复制当前页面的视图结构 =================
-          
-              private static void scheduleDump(final Activity a) {
-                  try {
-                      Toast.makeText(a, "15 秒内请回到抖音视频页面，之后会自动复制页面结构",
-                              Toast.LENGTH_LONG).show();
-                  } catch (Throwable ignored) { }
-                  new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
-                      @Override
-                      public void run() {
-                          try {
-                              Activity t = cur != null ? cur.get() : null;
-                              if (t == null) t = a;
-                              StringBuilder sb = new StringBuilder();
-                              sb.append("Activity: ").append(t.getClass().getName()).append('\n');
-                              int[] cnt = {0};
-                              dumpTree(t.getWindow().getDecorView(), 0, sb, cnt);
-                              ClipboardManager cm =
-                                      (ClipboardManager) t.getSystemService(Context.CLIPBOARD_SERVICE);
-                              cm.setPrimaryClip(ClipData.newPlainText("douyin_view_tree", sb.toString()));
-                              Toast.makeText(t, "页面结构已复制（" + cnt[0] + " 行），请粘贴发给我",
-                                      Toast.LENGTH_LONG).show();
-                          } catch (Throwable th) {
-                              XposedBridge.log(TAG + "dump 失败: " + th);
-                          }
-                      }
-                  }, 15000);
-              }
-          
-              private static void dumpTree(View v, int depth, StringBuilder sb, int[] cnt) {
-                  if (cnt[0] >= 700 || depth > 45) return;
-                  cnt[0]++;
-                  for (int i = 0; i < depth; i++) sb.append(' ');
-                  sb.append(v.getClass().getName());
-                  int id = v.getId();
-                  if (id != View.NO_ID) {
-                      try {
-                          sb.append(" #").append(v.getResources().getResourceEntryName(id));
-                      } catch (Throwable ignored) {
-                          sb.append(" #").append(id);
-                      }
-                  }
-                  sb.append(' ').append(v.getWidth()).append('x').append(v.getHeight());
-                  sb.append(" y=").append((int) v.getTranslationY());
-                  sb.append(" a=").append(String.format(Locale.US, "%.2f", v.getAlpha()));
-                  if (v.getVisibility() == View.GONE) sb.append(" GONE");
-                  else if (v.getVisibility() == View.INVISIBLE) sb.append(" INVIS");
-                  if (v.getLayerType() != View.LAYER_TYPE_NONE) sb.append(" layer=").append(v.getLayerType());
-                  sb.append('\n');
-                  if (v instanceof ViewGroup && v.getVisibility() != View.GONE) {
-                      ViewGroup g = (ViewGroup) v;
-                      for (int i = 0; i < g.getChildCount(); i++) dumpTree(g.getChildAt(i), depth + 1, sb, cnt);
-                  }
-              }
-          
-              // ================= 滚动 Hook =================
-          
-              private void hookScroller(Class<?> c, final String name) {
-                  try {
-                      XposedHelpers.findAndHookMethod(c, "startScroll",
-                              int.class, int.class, int.class, int.class, int.class,
-                              new XC_MethodHook() {
-                                  @Override
-                                  protected void beforeHookedMethod(MethodHookParam p) {
-                                      int dx = (int) p.args[2];
-                                      int dy = (int) p.args[3];
-                                      if (DEBUG) logCaller(name + ".startScroll", dx, dy);
-                                      if (!isPageScroll(dx, dy)) return;
-                                      try {
-                                          XposedHelpers.setObjectField(p.thisObject, "mInterpolator", SPRING);
-                                      } catch (Throwable t) {
-                                          XposedBridge.log(TAG + "设置 mInterpolator 失败: " + t);
-                                          return;
-                                      }
-                                      p.args[4] = pageDuration(dy);
-                                  }
-                              });
-                  } catch (Throwable t) {
-                      XposedBridge.log(TAG + "hook " + name + " 失败: " + t);
-                  }
-              }
-          
-              private static void logCaller(String what, int dx, int dy) {
-                  try {
-                      StackTraceElement[] st = new Throwable().getStackTrace();
-                      StringBuilder sb = new StringBuilder();
-                      int n = 0;
-                      for (StackTraceElement e : st) {
-                          String cn = e.getClassName();
-                          if (cn.startsWith("android.") || cn.startsWith("java.")
-                                  || cn.startsWith("de.robv") || cn.startsWith("LSP")
-                                  || cn.startsWith("org.lsposed") || cn.startsWith("com.example.douyinspring")) {
-                              continue;
-                          }
-                          sb.append("\n    ").append(cn).append('.').append(e.getMethodName());
-                          if (++n >= 4) break;
-                      }
-                      String key = what + sb;
-                      if (seen.add(key)) {
-                          XposedBridge.log(TAG + what + " dx=" + dx + " dy=" + dy + " 调用者:" + sb);
-                      }
-                  } catch (Throwable ignored) { }
-              }
-          
-              /** 只处理竖向、距离足够大的滚动（翻页和回弹），小的滚动保持原样 */
-              private static boolean isPageScroll(int dx, int dy) {
-                  if (!enabled || dx != 0) return false;
-                  float density = android.content.res.Resources.getSystem().getDisplayMetrics().density;
-                  return Math.abs(dy) >= 24 * density;
-              }
-          
-              /** 时长随距离缩放：整页翻动用满时长，距离短（拖一点点松手回弹）则相应缩短 */
-              private static int pageDuration(int dy) {
-                  float h = android.content.res.Resources.getSystem().getDisplayMetrics().heightPixels;
-                  float frac = Math.min(1f, Math.abs(dy) / h);
-                  return Math.max(120, Math.round(durMs * (0.45f + 0.55f * frac)));
-              }
-          
-              /**
-               * 曲线按你提供的参考录屏逐帧测得：起步迅速、后段平缓减速（贝塞尔 0.15,0.3,0.7,1）。
-               * bounce>0 时终点控制点上移，产生一次轻微的越过再回落。
-               */
-              static Interpolator buildCurve(float bounce) {
-                  return new PathInterpolator(0.15f, 0.3f, 0.7f, 1f + bounce);
-              }
-          
-              static class SpringInterpolator implements Interpolator {
-                  @Override
-                  public float getInterpolation(float t) {
-                      if (t <= 0f) return 0f;
-                      if (t >= 1f) return 1f;
-                      if (!enabled) {
-                          float x = t - 1f;
-                          return x * x * x * x * x + 1f;
-                      }
-                      return curve.getInterpolation(t);
                   }
               }
           }
