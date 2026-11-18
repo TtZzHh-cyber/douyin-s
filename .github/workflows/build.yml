@@ -103,6 +103,7 @@ jobs:
           import android.os.Handler;
           import android.os.Looper;
           import android.util.DisplayMetrics;
+          import android.view.Display;
           import android.view.Gravity;
           import android.view.MotionEvent;
           import android.view.View;
@@ -125,6 +126,7 @@ jobs:
           import java.util.HashSet;
           import java.util.Locale;
           import java.util.Set;
+          import java.util.TreeSet;
           
           import de.robv.android.xposed.IXposedHookLoadPackage;
           import de.robv.android.xposed.XC_MethodHook;
@@ -148,6 +150,7 @@ jobs:
           
               // ===== 运行时可调参数（由菜单修改） =====
               static volatile boolean enabled = true;
+              static volatile boolean highRefresh = true;
               static volatile int durMs = DEF_DUR_MS;
               static volatile float bounce = DEF_BOUNCE;
               static volatile Interpolator curve = buildCurve(DEF_BOUNCE);
@@ -252,6 +255,7 @@ jobs:
                                           loadCfg(a);
                                           cur = new java.lang.ref.WeakReference<Activity>(a);
                                           scheduleEntryCheck(a);
+                                          applyHighRefresh(a);
                                       } catch (Throwable t) {
                                           XposedBridge.log(TAG + "entry 失败: " + t);
                                       }
@@ -272,6 +276,7 @@ jobs:
                   try {
                       SharedPreferences sp = c.getSharedPreferences(PREF, 0);
                       enabled = sp.getBoolean("enabled", true);
+                      highRefresh = sp.getBoolean("highRefresh", true);
                       durMs = sp.getInt("durMs", DEF_DUR_MS);
                       bounce = sp.getFloat("bounce", DEF_BOUNCE);
                       curve = buildCurve(bounce);
@@ -282,6 +287,7 @@ jobs:
                   try {
                       c.getSharedPreferences(PREF, 0).edit()
                               .putBoolean("enabled", enabled)
+                              .putBoolean("highRefresh", highRefresh)
                               .putInt("durMs", durMs)
                               .putFloat("bounce", bounce)
                               .apply();
@@ -315,6 +321,8 @@ jobs:
               }
           
               private static void scheduleEntryCheck(final Activity a) {
+                  // 首页 MainActivity 的视图树非常大，反复遍历会造成掉帧，设置页不在这里，直接跳过
+                  if (a.getClass().getName().endsWith(".main.MainActivity")) return;
                   View decor = a.getWindow().getDecorView();
                   if (!(decor instanceof FrameLayout)) return;
                   final FrameLayout fl = (FrameLayout) decor;
@@ -331,7 +339,7 @@ jobs:
                                   return;
                               }
                           } catch (Throwable ignored) { }
-                          if (++tries[0] < 8) fl.postDelayed(this, 500);
+                          if (++tries[0] < 4) fl.postDelayed(this, 600);
                       }
                   };
                   fl.postDelayed(r, 400);
@@ -446,6 +454,29 @@ jobs:
                       });
                       root.addView(sw);
           
+                      Switch hr = new Switch(a);
+                      hr.setText("强制最高刷新率（更流畅，更费电）");
+                      hr.setTextColor(0xFF222222);
+                      hr.setChecked(highRefresh);
+                      hr.setPadding(0, dp(a, 12), 0, 0);
+                      hr.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+                          @Override
+                          public void onCheckedChanged(CompoundButton b, boolean c) {
+                              highRefresh = c;
+                              saveCfg(a);
+                              if (c) applyHighRefresh(a);
+                              else resetRefresh(a);
+                          }
+                      });
+                      root.addView(hr);
+          
+                      TextView rate = new TextView(a);
+                      rate.setText(refreshInfo(a));
+                      rate.setTextColor(0xFF888888);
+                      rate.setTextSize(12);
+                      rate.setPadding(0, dp(a, 4), 0, 0);
+                      root.addView(rate);
+          
                       addSlider(a, root, "翻页时长（毫秒，越大越慢）", 150f, 800f, 10f, durMs,
                               new FloatSetter() {
                                   @Override
@@ -516,6 +547,75 @@ jobs:
                   } catch (Throwable t) {
                       menuShowing = false;
                       XposedBridge.log(TAG + "showMenu 失败: " + t);
+                  }
+              }
+          
+              // ================= 刷新率 =================
+          
+              private static Display.Mode bestMode(Display d) {
+                  Display.Mode cur = d.getMode();
+                  Display.Mode best = cur;
+                  for (Display.Mode m : d.getSupportedModes()) {
+                      if (m.getPhysicalWidth() == cur.getPhysicalWidth()
+                              && m.getPhysicalHeight() == cur.getPhysicalHeight()
+                              && m.getRefreshRate() > best.getRefreshRate() + 0.5f) {
+                          best = m;
+                      }
+                  }
+                  return best;
+              }
+          
+              /** 请求该窗口使用屏幕支持的最高刷新率（部分系统会忽略此请求） */
+              private static void applyHighRefresh(Activity a) {
+                  if (!highRefresh) return;
+                  try {
+                      Window w = a.getWindow();
+                      Display d = a.getWindowManager().getDefaultDisplay();
+                      Display.Mode best = bestMode(d);
+                      WindowManager.LayoutParams lp = w.getAttributes();
+                      if (lp.preferredDisplayModeId != best.getModeId()
+                              || lp.preferredRefreshRate != best.getRefreshRate()) {
+                          lp.preferredDisplayModeId = best.getModeId();
+                          lp.preferredRefreshRate = best.getRefreshRate();
+                          w.setAttributes(lp);
+                      }
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "高刷设置失败: " + t);
+                  }
+              }
+          
+              private static void resetRefresh(Activity a) {
+                  try {
+                      Window w = a.getWindow();
+                      WindowManager.LayoutParams lp = w.getAttributes();
+                      lp.preferredDisplayModeId = 0;
+                      lp.preferredRefreshRate = 0f;
+                      w.setAttributes(lp);
+                  } catch (Throwable ignored) { }
+              }
+          
+              private static String refreshInfo(Activity a) {
+                  try {
+                      Display d = a.getWindowManager().getDefaultDisplay();
+                      Display.Mode cur = d.getMode();
+                      TreeSet<Integer> rates = new TreeSet<>();
+                      for (Display.Mode m : d.getSupportedModes()) {
+                          if (m.getPhysicalWidth() == cur.getPhysicalWidth()
+                                  && m.getPhysicalHeight() == cur.getPhysicalHeight()) {
+                              rates.add(Math.round(m.getRefreshRate()));
+                          }
+                      }
+                      StringBuilder sb = new StringBuilder("屏幕支持：");
+                      boolean first = true;
+                      for (int r : rates) {
+                          if (!first) sb.append(" / ");
+                          sb.append(r);
+                          first = false;
+                      }
+                      sb.append(" Hz，当前 ").append(Math.round(d.getRefreshRate())).append(" Hz");
+                      return sb.toString();
+                  } catch (Throwable t) {
+                      return "无法读取刷新率";
                   }
               }
           
